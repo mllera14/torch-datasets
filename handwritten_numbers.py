@@ -7,7 +7,8 @@ import torchvision.transforms as trans
 import torchvision.datasets as dataset
 
 
-def group_img_by_class(ixc_pair):
+def group_img_by_digit(mnist):
+    ixc_pair = [(mnist[i][1], i) for i in range(len(mnist))]
     ixc_pair  = sorted(ixc_pair, key=lambda x: x[0])
 
     current = ixc_pair[0][0]
@@ -23,227 +24,114 @@ def group_img_by_class(ixc_pair):
     return groups
 
 
-class RandomGenerator:
-    def __init__(self, nsamples, ndigits, groups, rng=None, filter_fn=None):
-        self.ndigits = ndigits
-        self.idx = groups
-        self.classes = list(groups.keys())
-        self.rng = rng if rng is not None else np.random
-        self.nsamples = nsamples
-        self.filter = filter_fn
+def trim_leading_zeros(img_shape, images, targets):
+    empty_image = torch.zeros_like(images[0, 0])
 
-    @property
-    def n_classes(self):
-        return len(self.classes)
-
-    def _generate(self, all_numbers):
-        digits = all_numbers[self.rng.choice(len(all_numbers))]
-        # digits = self.rng.choice(list(all_numbers))
-        idx = [self.rng.choice(self.idx[d]) for d in digits]
-
-        return idx[::-1]
-
-    def __iter__(self):
-        init_state = self.rng.get_state()
-        all_numbers = list(filter(self.filter, product(self.classes, repeat=self.ndigits)))
-
-        for _ in range(self.nsamples):
-            yield self._generate(all_numbers)
-
-        self.rng.set_state(init_state)
-
-
-class OrderedGenerator:
-    def __init__(self, nsamples, ndigits, groups, rng=None, filter_fn=None):
-        self.ndigits = ndigits
-        self.idx = groups
-        self.classes = list(groups.keys())
-        self.rng = np.random
-        self.nsamples = nsamples
-        self.filter = filter_fn
-
-    def _generate(self, digits):
-        idx = [self.rng.choice(self.idx[d]) for d in digits]
-        return idx
-
-    def __iter__(self):
-        init_state = self.rng.get_state()
-
-        all_numbers = filter(
-            self.filter, product(self.classes, repeat=self.ndigits))
-
-        for i, digits in enumerate(cycle(all_numbers)):
-            if i >= self.nsamples:
-                break
+    for i in range(images.shape[0]-1):
+        for j in range(images.shape[1]):
+            if targets[i * images.shape[1] + j] == 0:
+                images[i, j] = empty_image
             else:
-                yield self._generate(list(digits))
+                break
 
-        self.rng.set_state(init_state)
+def process_inputs(images, batch_shape, digit_shape):
+    bs, nd = batch_shape
+    images = [img.view(*digit_shape) for img in images]
+    images = [torch.cat(images[i:i+nd], dim=1) for i in range(bs)]
+    return torch.stack(images).view(*batch_shape, -1)
 
 
-class HWND(Dataset):
-    def __init__(self, mnist, ndigits, shape, dataset_size,
-                    rng=None, sampler='random', filter_fn=None):
+def process_labels(labels, batch_shape):
+    bs, nd = batch_shape
+    pof10 = torch.tensor([10 ** (p-1) for p in np.arange(nd,0,-1)])
+
+    labels = torch.as_tensor([labels[i:i+nd] for i in range(bs)])
+    labels *= pof10
+
+    return labels.sum(dim=-1)
+
+class HandwrittenNumberGenerator:
+    def __init__(self, mnist, ndigits, digit_shape, supervised=True, dataset_size=1000,
+            batch_size=32, leading_zeros=False, infinite_gen=True, random_state=None):
         self.mnist = mnist
-        self.ndigits = ndigits
+        self.ndigts = ndigits
+        self.digit_shape = digit_shape
+        self.batch_size = batch_size
         self.dataset_size = dataset_size
-        self.rng = rng
-        self.shape = shape
+        self.leading_zeros = leading_zeros
+        self.infinite_gen = infinite_gen
+        self.supervised = supervised
 
-        ixc_pair = [(mnist[i][1], i) for i in range(len(mnist))]
-        groups = group_img_by_class(ixc_pair)
+        if random_state is None or isinstance(random_state, int):
+            random_state = np.random.RandomState(random_state)
 
-        if type(sampler) == str:
-            if sampler == 'random':
-                sampler = RandomGenerator(
-                    dataset_size, ndigits, groups, self.rng, filter_fn)
-            elif sampler == 'ordered':
-                sampler = OrderedGenerator(
-                    dataset_size, ndigits, groups, self.rng, filter_fn)
-            else:
-                raise ValueError('Unknown sampling procedure')
+        self.rng = random_state
+        self.init_state = random_state.get_state()
 
-        indexes = []
+        # store which datapoints belong to which class
+        # self._idx_by_digit = group_img_by_digit(mnist)
 
-        for i, imgidx in enumerate(sampler):
-            if i >= self.dataset_size:
-                break
-            self._trim_leading_zeros(imgidx)
-            indexes.append(imgidx)
-
-        self.empty_image = torch.zeros_like(mnist[0][0])
-        self.img_idx = indexes
-
-    def _trim_leading_zeros(self, imgidx):
-        for i in range(len(imgidx) - 1):
-            if self.mnist[imgidx[i]][1] == 0:
-                imgidx[i] = -1
-            else:
-                break
-
-    def _get_target(self, idx):
-        digits = [self.mnist[d][1] for d in self.img_idx[idx]]
-        label = 0
-        for i, d in enumerate(digits[::-1]):
-            if d == -1:
-                d = 0
-            label += d * (10 ** i)
-        return label
-
-    def _get_images(self, idx):
-        images = []
-        for i in self.img_idx[idx]:
-            if i == -1:
-                images.append(self.empty_image.view(*self.shape))
-            else:
-                images.append(self.mnist[i][0].view(*self.shape))
-
-        return torch.cat(images, dim=1).view(1, -1)
-
-
-    def __getitem__(self, index):
-        images = self._get_images(index)
-        label = self._get_target(index)
-
-        return images, label
 
     def __len__(self):
-        return len(self.img_idx)
+        return int(np.ceil(self.dataset_size / self.batch_size))
+
+    def __iter__(self):
+        for _ in range(len(self)):
+            yield self.next_batch()
+        if not self.infinite_gen:
+            self.reset()
+
+    def reset(self):
+        self.rng.set_state(self.init_state)
+
+    def next_batch(self):
+        batch_shape = self.batch_size, self.ndigts
+
+        idx = self.rng.choice(range(len(self.mnist)), size=batch_shape).reshape(-1)
+
+        inputs, labels = [],[]
+        for i in idx:
+            img, lbl = self.mnist[i]
+            inputs.append(img)
+            labels.append(lbl)
+
+        inputs = process_inputs(inputs, batch_shape, self.digit_shape)
+        if not self.leading_zeros:
+            trim_leading_zeros(self.digit_shape, inputs, labels)
+
+        inputs = inputs.view(self.batch_size, -1)
+
+        if self.supervised:
+            targets = process_labels(targets, batch_shape)
+        else:
+            targets = inputs
+
+        return inputs, targets
 
 
-class HWNSeq(Dataset):
+class SequenceGenerator:
     def __init__(self, generators):
         self.generators = generators
-        self.seqlen = len(generators)
-
-        indexes = product(*[range(len(g)) for g in generators])
-        self.indexes = list(indexes)
-
-    def __getitem__(self, idx):
-        images, labels = [], []
-
-        indexes = self.indexes[idx]
-
-        for i, g in zip(indexes, self.generators):
-            img, label = g[i]
-            images.extend(img)
-            labels.append(label)
-
-        images = torch.stack(images)
-        labels = torch.as_tensor(labels)
-
-        return images, labels
-
 
     def __len__(self):
-        return len(self.indexes)
+        return len(self.generators[0])
 
+    def __iter__(self):
+        for _ in range(len(self)):
+            yield self.next_batch()
 
-def load_hwnd(mnist_path, dataset_size, ndigits=3, crop_shape=(22, 20), batch_size=50,
-                val_split_ratio=0.2, rng=None, download=False):
-    train_raw, test_raw = load_raw(mnist_path, crop_shape, download)
+    def next_batch(self):
+        inputs, targets = [], []
 
-    training_set = HWND(train_raw, ndigits, crop_shape, dataset_size, rng)
-    test_set = HWND(test_raw, ndigits, crop_shape, dataset_size, rng)
+        for gen in self.generators:
+            images, labels = gen.next_batch()
+            inputs.append(images)
+            targets.append(labels)
 
-    # Split train data into training and validation sets
-    if val_split_ratio > 0:
-        N = len(training_set)
-        val_size = int(N * val_split_ratio)
-        training_set, validation_set = torch.utils.data.random_split(
-            training_set, [N - val_size, val_size])
-        validation_set = DataLoader(validation_set, batch_size=val_size, shuffle=False)
-    else:
-        validation_set = None
+        inputs = torch.stack(inputs, dim=1)
+        targets = torch.stack(targets, dim=1)
 
-    training_set = DataLoader(training_set, batch_size=batch_size, shuffle=True)
-    test_set = DataLoader(test_set, batch_size=len(train_raw), shuffle=False)
-
-    return training_set, test_set, validation_set
-
-
-def load_hwnseq(
-    mnist_path,
-    seqlen, examples_per_pos,
-    ndigits, digit_shape,
-    train_filters=None,
-    test_filters=None,
-    batch_size=50,
-    val_split_ratio=0.2,
-    rng=None,
-    download=False):
-
-    train_raw, test_raw = load_raw(mnist_path, digit_shape, download)
-
-    training_gen = []
-    test_gen = []
-
-    for i in range(seqlen):
-        filter_fn = None if train_filters is None else train_filters[i]
-        tr_set = HWND(train_raw, ndigits, digit_shape, examples_per_pos, filter_fn=filter_fn, rng=rng)
-
-        filter_fn = None if test_filters is None else test_filters[i]
-        te_set = HWND(test_raw, ndigits, digit_shape, examples_per_pos, filter_fn=filter_fn, rng=rng)
-
-        training_gen.append(tr_set)
-        test_gen.append(te_set)
-
-    training_set = HWNSeq(training_gen)
-    test_set = HWNSeq(test_gen)
-
-    if val_split_ratio > 0:
-        N = len(training_set)
-        val_size = int(N * val_split_ratio)
-        training_set, validation_set = torch.utils.data.random_split(
-            training_set, [N - val_size, val_size])
-        validation_set = DataLoader(validation_set, batch_size=val_size, shuffle=False)
-    else:
-        validation_set = None
-
-    training_set = DataLoader(training_set, batch_size=batch_size, shuffle=True)
-    test_set = DataLoader(test_set, batch_size=len(test_set), shuffle=False)
-
-    return training_set, test_set, validation_set
+        return inputs, targets
 
 
 def load_raw(data_path, crop_shape=(22, 20), download=False):
@@ -259,3 +147,137 @@ def load_raw(data_path, crop_shape=(22, 20), download=False):
         root=data_path, train=False, transform=transform, download=download)
 
     return train_data, test_data
+
+
+def load_handwritten_number_data(
+        mnist_path,
+        dataset_size=1000,
+        ndigits=3,
+        digit_shape=(22, 20),
+        supervised=True,
+        batch_size=50,
+        leading_zeros=False,
+        infinite_gen=True,
+        random_state=None,
+        download=False
+    ):
+    train_raw, test_raw = load_raw(mnist_path, digit_shape, download)
+
+    if random_state is None or isinstance(random_state, int):
+        random_state = np.random.RandomState(random_state)
+
+    training_set = HandwrittenNumberGenerator(
+        mnist=train_raw,
+        ndigits=ndigits,
+        digit_shape=digit_shape,
+        supervised=supervised,
+        dataset_size=dataset_size,
+        batch_size=batch_size,
+        leadning_zeros=False,
+        infinite_gen=True,
+        random_state=random_state.randint(2**32-1) if not infinite_gen else random_state
+    )
+
+    test_set = HandwrittenNumberGenerator(
+        mnist=test_raw,
+        ndigits=ndigits,
+        digit_shape=digit_shape,
+        supervised=supervised,
+        dataset_size=dataset_size,
+        batch_size=batch_size,
+        leadning_zeros=False,
+        infinite_gen=True,
+        random_state=random_state.randint(2**32-1) if not infinite_gen else random_state
+    )
+
+    if infinite_gen:
+        validation_set = training_set
+    else:
+        validation_set = HandwrittenNumberGenerator(
+            mnist=train_raw,
+            ndigits=ndigits,
+            digit_shape=digit_shape,
+            supervised=supervised,
+            dataset_size=dataset_size,
+            batch_size=batch_size,
+            leadning_zeros=False,
+            infinite_gen=True,
+            rng=random_state.randint(2**32-1) if not infinite_gen else random_state
+        )
+
+    return training_set, test_set, validation_set
+
+
+def load_handwritten_sequence(
+        mnist_path, size,
+        seqlen, ndigits,
+        digit_shape,
+        supervised=True,
+        batch_size=50,
+        infinite_gen=True,
+        leading_zeros=False,
+        train_filters=None,
+        test_filters=None,
+        random_state=None,
+        download=False
+    ):
+
+    train_raw, test_raw = load_raw(mnist_path, digit_shape, download)
+
+    training_gen = []
+    test_gen = []
+
+    if random_state is None or isinstance(random_state, int):
+        random_state = np.random.RandomState(random_state)
+
+    for i in range(seqlen):
+        data = train_raw if train_filters is None else filter(train_filters[i], train_raw)
+        training_gen.append(HandwrittenNumberGenerator(
+            mnist=data,
+            ndigits=ndigits,
+            digit_shape=digit_shape,
+            supervised=supervised,
+            dataset_size=size,
+            batch_size=batch_size,
+            leading_zeros=leading_zeros,
+            infinite_gen=infinite_gen,
+            random_state=random_state if infinite_gen else random_state.randint(2**32-1)
+        ))
+
+    for i in range(seqlen):
+        data = test_raw if test_filters is None else filter(test_filters[i], train_raw)
+        test_gen.append(HandwrittenNumberGenerator(
+            mnist=data,
+            ndigits=ndigits,
+            digit_shape=digit_shape,
+            supervised=supervised,
+            dataset_size=size,
+            batch_size=batch_size,
+            leading_zeros=leading_zeros,
+            infinite_gen=infinite_gen,
+            random_state=random_state if infinite_gen else random_state.randint(2**32-1)
+        ))
+
+    training_set = SequenceGenerator(training_gen)
+    test_set = SequenceGenerator(test_gen)
+
+    if not infinite_gen:
+        validation_gen = []
+        for i in range(seqlen):
+            data = train_raw if train_filters is None else filter(train_filters[i], train_raw)
+            validation_gen.append(HandwrittenNumberGenerator(
+                mnist=data,
+                ndigits=ndigits,
+                digit_shape=digit_shape,
+                supervised=supervised,
+                dataset_size=dataset_size,
+                batch_size=batch_size,
+                leading_zeros=leading_zeros,
+                infinite_gen=infinite_gen,
+                random_state=random_state.randint(2**32-1)
+            ))
+        validation_set = SequenceGenerator(validation_gen)
+    else:
+        validation_set = training_set
+
+    return training_set, validation_set, test_set
